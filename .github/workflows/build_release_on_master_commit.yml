@@ -1,0 +1,144 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Set the base version here. When you change this to "0.2", the patch resets to 0.
+env:
+  VERSION_PREFIX: "0.1"
+
+# Permissions required to create a Git tag and publish a GitHub Release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux (musl portable static binary) ---
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.xz
+            exe_ext: ""
+
+          # --- macOS (Apple Silicon & Intel) ---
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+            exe_ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+            exe_ext: ""
+
+          # --- Windows (x86_64 & ARM64) ---
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe_ext: ".exe"
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe_ext: ".exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install musl-tools (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools xz-utils
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Package Linux & macOS into .tar.xz
+      - name: Package (.tar.xz)
+        if: matrix.archive == 'tar.xz'
+        run: |
+          mkdir staging
+          cp target/${{ matrix.target }}/release/typ2pot staging/
+          cp target/${{ matrix.target }}/release/typ-translate staging/
+          tar -cJf "typst_po-${{ matrix.target }}.tar.xz" -C staging .
+
+      # Package Windows into .zip
+      - name: Package (.zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/typ2pot.exe" staging/
+          Copy-Item "target/${{ matrix.target }}/release/typ-translate.exe" staging/
+          Compress-Archive -Path "staging/*" -DestinationPath "typst_po-${{ matrix.target }}.zip"
+
+      # Upload temporary artifact to pass to the release job
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typst_po-${{ matrix.target }}
+          path: |
+            typst_po-${{ matrix.target }}.tar.xz
+            typst_po-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Release Job: runs only after all 5 build jobs finish successfully
+  # --------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (with full tag history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Determine the next patch number based on existing git tags
+      - name: Calculate next version tag
+        id: versioning
+        run: |
+          git fetch --tags --force
+          # Look for tags matching v<PREFIX>.<number>
+          LATEST_PATCH=$(git tag -l "v${VERSION_PREFIX}.*" | sed "s/^v${VERSION_PREFIX}\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1)
+
+          if [ -z "$LATEST_PATCH" ]; then
+            NEXT_PATCH=0
+          else
+            NEXT_PATCH=$((LATEST_PATCH + 1))
+          fi
+
+          TAG="v${VERSION_PREFIX}.${NEXT_PATCH}"
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "Determined next release tag: $TAG"
+
+      # Download all 5 matrix packages into a single folder
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: typst_po-*
+          merge-multiple: true
+
+      # Create tag and release using GitHub CLI
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.versioning.outputs.TAG }}" dist/* \
+            --title "${{ steps.versioning.outputs.TAG }}" \
+            --generate-notes
